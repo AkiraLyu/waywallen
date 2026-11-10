@@ -340,6 +340,48 @@ struct AudioRuntime {
     bool     pause_pending { false };
     Instant  pause_at {};
     float    target_scale { 1.0f };
+
+    rstd::f64 video_start_pts { -1.0 };
+    Instant   next_sync_check {};
+
+    // AvPlayer uses offsets from the start of its stream.
+    auto position_for_video_pts(rstd::f64 pts) -> rstd::f64 {
+        if (! pts.is_finite() || pts < rstd::f64()) return rstd::f64(-1.0);
+        if (video_start_pts < rstd::f64()) video_start_pts = pts;
+        return (pts - video_start_pts).max(rstd::f64());
+    }
+};
+
+class VideoTimeline {
+public:
+    auto previous_pts() const -> rstd::f64 { return previous_pts_; }
+
+    bool wrap(rstd::f64 first_pts, rstd::f64 fallback_interval) {
+        if (! first_pts.is_finite() || first_pts < rstd::f64() || previous_pts_ < rstd::f64())
+            return false;
+
+        // The decoder exposes PTS. Use the last observed interval as the final frame's duration.
+        const auto interval = frame_interval_ > rstd::f64() ? frame_interval_ : fallback_interval;
+        offset_ += previous_pts_ + interval - first_pts;
+        previous_pts_ = rstd::f64(-1.0);
+        return true;
+    }
+
+    auto append(rstd::f64 pts) -> rstd::f64 {
+        if (! pts.is_finite() || pts < rstd::f64()) {
+            previous_pts_ = rstd::f64(-1.0);
+            return previous_pts_;
+        }
+        if (previous_pts_ >= rstd::f64() && pts > previous_pts_)
+            frame_interval_ = pts - previous_pts_;
+        previous_pts_ = pts;
+        return pts + offset_;
+    }
+
+private:
+    rstd::f64 previous_pts_ { -1.0 };
+    rstd::f64 frame_interval_ {};
+    rstd::f64 offset_ {};
 };
 
 wavsen::video::HwAccel parse_hwdec(const char* v) {
@@ -770,6 +812,23 @@ void sync_audio_state(wavsen::audio::AvPlayer* av_player, AudioRuntime& audio, b
     } else {
         audio.pause_pending = false;
     }
+}
+
+void sync_audio_position(wavsen::audio::AvPlayer* player, AudioRuntime& audio,
+                         rstd::f64 video_position, float playback_rate) {
+    if (! player || ! audio.enabled || audio.paused || video_position < rstd::f64()) return;
+
+    const auto now = Instant::now();
+    if (now < audio.next_sync_check) return;
+    audio.next_sync_check = now + Duration::from_secs(u64(1));
+
+    const auto audio_position = player->current_time_seconds();
+    if (! audio_position.is_finite()) return;
+
+    // The device reports its position in batches. Correct large drift on the
+    // audio side while leaving frame deadlines tied to the video timeline.
+    const auto skew = (audio_position - video_position) / rstd::f64(playback_rate);
+    if (skew.abs() > rstd::f64(0.25)) player->seek_to(video_position);
 }
 
 // --selftest: open a video, decode frames, run YuvToRgba against
@@ -1371,8 +1430,7 @@ int run(int argc, char** argv) {
 
     /* --- Audio: open the same file as an rstd byte stream and attach AvPlayer.
      *   Failure (missing audio stream, unsupported codec, no audio device)
-     *   is non-fatal: log and continue without audio (presenter falls
-     *   back to wall-clock pacing). */
+     *   is non-fatal: log and continue video playback. */
     rstd::Option<rstd::boxed::Box<wavsen::audio::AvPlayer>> av_player;
     {
         auto audio_file_res =
@@ -1513,18 +1571,15 @@ int run(int argc, char** argv) {
     rstd_info("waywallen-video-renderer: decoder mode = {}", kind_label(decoder->get()->kind()));
 
     /* --- Main loop ----------------------------------------------------- */
-    wavsen::video::Presenter presenter; // PTS-driven pacing.
+    // Video PTS and the monotonic clock determine presentation in both audio modes.
+    wavsen::video::Presenter presenter;
     (void)presenter.set_playback_rate(
         rstd::f64(static_cast<double>(host.playback_rate.load(std::memory_order_acquire))));
-    if (auto* player = current_av_player()) {
-        presenter.set_external_clock([p = player] {
-            return p->current_time_seconds();
-        });
-    }
     wavsen::video::Nv12Frame frame;
-    rstd::f64                prev_pts { -1.0 }; // for loop-boundary detection (PTS regression)
-    rstd::f64                last_submitted_pts { -1.0 };
+    VideoTimeline            video_timeline;
+    rstd::f64                last_submitted_audio_pts { -1.0 };
     rstd::f64                pause_resume_pts { -1.0 };
+    bool                     restart_audio_pending = false;
     uint32_t                 stall_warn_counter = 0; // throttle ETIME log spam during backpressure
     bool                     submitted_since_negotiate = false;
     RetainedFrame            retained;
@@ -1544,9 +1599,10 @@ int run(int argc, char** argv) {
                     host.target_pending = false;
                     if (apply_video_target(host, **decoder, *yuv, retained, config)) {
                         submitted_since_negotiate = true;
-                        last_submitted_pts = retained.vk      ? retained.vk->info().pts_seconds
-                                             : retained.vaapi ? retained.vaapi->view().pts_seconds
-                                                              : retained.sw.pts_seconds;
+                        const auto pts = retained.vk      ? retained.vk->info().pts_seconds
+                                         : retained.vaapi ? retained.vaapi->view().pts_seconds
+                                                          : retained.sw.pts_seconds;
+                        last_submitted_audio_pts = audio_runtime.position_for_video_pts(pts);
                     }
                     return LoopStep::again();
                 }
@@ -1577,6 +1633,12 @@ int run(int argc, char** argv) {
                 presenter.reset();
             }
 
+            /* The preceding iteration waited for the loop boundary on the video timeline. */
+            if (restart_audio_pending) {
+                if (auto* player = current_av_player()) player->seek_to_start();
+                restart_audio_pending = false;
+            }
+
             /* Runtime audio controls do not reopen the media decoder. */
             if (host.volume_pending.exchange(false, std::memory_order_acq_rel)) {
                 audio_runtime.volume_pct = host.pending_volume.load(std::memory_order_acquire);
@@ -1601,12 +1663,12 @@ int run(int argc, char** argv) {
             }
             if (host.enable_audio_pending.exchange(false, std::memory_order_acq_rel)) {
                 const bool audio_enabled = effective_audio_enabled(host);
-                set_audio_device_enabled(current_av_player(),
-                                         audio_runtime,
-                                         audio_enabled,
-                                         prev_pts,
-                                         audio_runtime.volume_pct);
-                presenter.reset();
+                set_audio_device_enabled(
+                    current_av_player(),
+                    audio_runtime,
+                    audio_enabled,
+                    audio_runtime.position_for_video_pts(video_timeline.previous_pts()),
+                    audio_runtime.volume_pct);
             }
             const bool audio_gate_open = host.audio_gate_open.load(std::memory_order_acquire);
             const bool paused_now      = host.paused.load(std::memory_order_acquire);
@@ -1614,7 +1676,11 @@ int run(int argc, char** argv) {
             const bool pause_started     = ! audio_runtime.paused && paused_now;
             const bool resumed_now       = audio_runtime.paused && ! paused_now;
             const uint64_t frame_request = pending_frame_request(host);
-            if (pause_started) pause_resume_pts = last_submitted_pts;
+            if (pause_started) {
+                const auto position =
+                    audio_runtime.position_for_video_pts(video_timeline.previous_pts());
+                pause_resume_pts = position >= rstd::f64() ? position : last_submitted_audio_pts;
+            }
             if (resumed_now && audio_runtime.enabled && pause_resume_pts >= rstd::f64()) {
                 if (auto* player = current_av_player()) player->seek_to(pause_resume_pts);
             }
@@ -1682,7 +1748,7 @@ int run(int argc, char** argv) {
                         presenter.reset();
                         // Video reopened at PTS 0 — keep audio aligned.
                         if (auto* player = current_av_player()) player->seek_to_start();
-                        prev_pts = rstd::f64(-1.0);
+                        video_timeline = {};
                         publish_hwdec_tag(host, decoder->get()->kind());
                         rstd_info("waywallen-video-renderer: reopened, kind={}",
                                   kind_label(decoder->get()->kind()));
@@ -1781,22 +1847,27 @@ int run(int argc, char** argv) {
             case wavsen::video::FrameKind::Sw: frame_pts = frame.pts_seconds; break;
             }
 
-            const bool pts_regressed = frame_pts >= rstd::f64() && prev_pts >= rstd::f64() &&
-                                       frame_pts + rstd::f64(0.5) < prev_pts;
+            const auto frame_fps     = host.fps;
+            const auto frame_rate    = host.playback_rate.load(std::memory_order_acquire);
+            const bool pts_regressed = frame_pts >= rstd::f64() &&
+                                       frame_pts + rstd::f64(0.5) < video_timeline.previous_pts();
             if (decoder_looped || pts_regressed) {
-                frame_rate_limit.reset();
-                if (auto* player = current_av_player()) player->seek_to_start();
-                presenter.reset();
+                const rstd::f64 fallback_interval(static_cast<double>(frame_rate) / frame_fps);
+                if (! decoder_looped || ! video_timeline.wrap(frame_pts, fallback_interval)) {
+                    video_timeline = {};
+                    frame_rate_limit.reset();
+                    presenter.reset();
+                }
+                restart_audio_pending = true;
             }
-            prev_pts = frame_pts;
+            const auto timeline_pts   = video_timeline.append(frame_pts);
+            const auto video_position = audio_runtime.position_for_video_pts(frame_pts);
 
-            const auto presentation = presenter.schedule_frame(frame_pts);
+            const auto presentation = presenter.schedule_frame(timeline_pts);
             if (! presentation.present) return LoopStep::again();
 
-            // Keep PTS pacing even for skipped frames so decoding cannot run ahead of audio.
-            const auto frame_fps  = host.fps;
-            const auto frame_rate = host.playback_rate.load(std::memory_order_acquire);
-            if (! frame_rate_limit.ready(frame_pts.to_primitive(), frame_fps, frame_rate)) {
+            // Keep PTS pacing even for skipped frames so decoding follows the video timeline.
+            if (! frame_rate_limit.ready(timeline_pts.to_primitive(), frame_fps, frame_rate)) {
                 (void)wait_for_presentation(host, presentation);
                 return LoopStep::again();
             }
@@ -1968,7 +2039,7 @@ int run(int argc, char** argv) {
                 host.events->request_stop(ExitCause::Failure);
                 return LoopStep::again();
             }
-            frame_rate_limit.submitted(frame_pts.to_primitive(), frame_fps, frame_rate);
+            frame_rate_limit.submitted(timeline_pts.to_primitive(), frame_fps, frame_rate);
             submitted_since_negotiate = true;
             if (automatic) {
                 if (fkind == wavsen::video::FrameKind::Sw) {
@@ -1980,7 +2051,9 @@ int run(int argc, char** argv) {
                 }
                 retained.valid = true;
             }
-            if (frame_pts >= rstd::f64()) last_submitted_pts = frame_pts;
+            if (video_position >= rstd::f64()) last_submitted_audio_pts = video_position;
+            if (! restart_audio_pending)
+                sync_audio_position(current_av_player(), audio_runtime, video_position, frame_rate);
             complete_frame_request(host, frame_request);
             return LoopStep::again();
         });
